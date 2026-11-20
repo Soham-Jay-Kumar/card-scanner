@@ -3,7 +3,7 @@
  * Owned by the Chief Engineer. Takes its settings as arguments, so tests can
  * point the whole app at a temp folder and the QA fake server.
  */
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, rename, rm, stat } from 'node:fs/promises';
 import { extname, join } from 'node:path';
@@ -75,6 +75,11 @@ export interface AppOptions {
   baseURL?: string;
   /** Built web app folder. Omit when only the API is needed. */
   staticDir?: string;
+  /**
+   * Set when the app is hosted on a public URL. Every request then needs this
+   * password (HTTP Basic auth, any username) instead of the localhost-only rule.
+   */
+  password?: string;
 }
 
 export interface CardScannerApp {
@@ -126,15 +131,35 @@ export function createApp(options: AppOptions): CardScannerApp {
 
   const http = new Hono();
 
-  /** The app listens on this Mac only, but any website could still call localhost, so refuse those. */
+  const sha = (value: string) => createHash('sha256').update(value).digest();
+  const passwordHash = options.password ? sha(options.password) : null;
+
+  if (passwordHash) {
+    // Hosted mode: the whole site, API included, sits behind one shared password.
+    http.use('*', async (c, next) => {
+      const header = c.req.header('authorization') ?? '';
+      let supplied = '';
+      if (header.startsWith('Basic ')) {
+        const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+        supplied = decoded.slice(decoded.indexOf(':') + 1);
+      }
+      if (!timingSafeEqual(sha(supplied), passwordHash)) {
+        return c.text('Password required.', 401, { 'WWW-Authenticate': 'Basic realm="Card Scanner", charset="UTF-8"' });
+      }
+      await next();
+    });
+  }
+
+  /** Browsers resend saved credentials on cross-site requests, so refuse those on the API. */
   http.use('/api/*', async (c, next) => {
     const origin = c.req.header('origin');
     const fetchSite = c.req.header('sec-fetch-site');
-    const allowed =
-      LOCAL_HOST.test(c.req.header('host') ?? '') &&
-      (!origin || LOCAL_ORIGIN.test(origin)) &&
-      (!fetchSite || fetchSite === 'same-origin' || fetchSite === 'same-site' || fetchSite === 'none');
-    if (!allowed) return c.json({ error: 'Requests are only accepted from this Mac.' }, 403);
+    const host = c.req.header('host') ?? '';
+    const originOk = passwordHash
+      ? !origin || (() => { try { return new URL(origin).host === host; } catch { return false; } })()
+      : LOCAL_HOST.test(host) && (!origin || LOCAL_ORIGIN.test(origin));
+    const allowed = originOk && (!fetchSite || fetchSite === 'same-origin' || fetchSite === 'same-site' || fetchSite === 'none');
+    if (!allowed) return c.json({ error: passwordHash ? 'Cross-site requests are not accepted.' : 'Requests are only accepted from this Mac.' }, 403);
     await next();
   });
 
