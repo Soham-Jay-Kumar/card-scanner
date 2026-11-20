@@ -16,7 +16,17 @@ it('takes a 36-card photo with mixed rotations from upload to read images', asyn
   const cardWidth = 180;
   const cardHeight = 100;
   const grid = gridBoxes({ columns: 6, rows: 6, cardWidth, cardHeight, gap: 90, margin: 50 });
-  const cardPng = await sharp(cornersRaw(cardWidth, cardHeight), { raw: { width: cardWidth, height: cardHeight, channels: 3 } }).png().toBuffer();
+  // The colours sit inside a plain border, as printing does. Colours running to the very edge would put a
+  // line right across the middle of every card, which the pixel check would take for a seam between two.
+  const borderX = 24;
+  const borderY = 12;
+  const artWidth = cardWidth - borderX * 2;
+  const artHeight = cardHeight - borderY * 2;
+  const art = await sharp(cornersRaw(artWidth, artHeight), { raw: { width: artWidth, height: artHeight, channels: 3 } }).png().toBuffer();
+  const cardPng = await sharp({ create: { width: cardWidth, height: cardHeight, channels: 3, background: '#f2f2f2' } })
+    .composite([{ input: art, left: borderX, top: borderY }])
+    .png()
+    .toBuffer();
   const rotations = grid.boxes.map((_, index) => ([0, 90, 180, 270] as Rotation[])[index % 4]!);
 
   // Rotated cards are drawn turned on their centre, so their boxes differ from the grid's.

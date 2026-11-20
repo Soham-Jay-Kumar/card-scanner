@@ -49,7 +49,8 @@ describe('two passes', () => {
       await sharp(cornersRaw(400, 300), { raw: { width: 400, height: 300, channels: 3 } }).linear(0.5, 40).png().toBuffer(),
       path.join(dir, 'detailed.jpg'),
     );
-    const llm = fakeLlm(cardsAnswer([CARD_A]));
+    // Away from this image's colour boundaries, which are real edges and would send the box for a second look.
+    const llm = fakeLlm(cardsAnswer([box(20, 20, 80, 80)]));
     const seen: Array<{ bytes: Buffer; width: number }> = [];
     const spying = {
       parse: async (request: Parameters<typeof llm.parse>[0], ctx: Parameters<typeof llm.parse>[1]) => {
@@ -447,3 +448,91 @@ describe('readingOrder', () => {
   });
 });
 
+describe('boxes that run through two cards', () => {
+  const NEIGHBOUR = box(400, 100, 700, 280);
+  const STRADDLER = box(250, 100, 550, 280);
+
+  it('drops a box holding half of each of two cards, keeping both cards', async () => {
+    const result = await locateCards(fakeLlm(cardsAnswer([STRADDLER]), cardsAnswer([CARD_A, NEIGHBOUR])), image, LOCATE_CTX);
+    expect(result.locations.map(({ box: { x } }) => x)).toEqual([50, 200]);
+    expect(result.countConfirmed).toBe(false);
+    expect(result.note).toMatch(/straddling two cards/);
+  });
+
+  it('keeps a middle card that overlaps each of its neighbours by only a sliver', async () => {
+    const left = box(100, 100, 400, 280);
+    const middle = box(390, 100, 690, 280);
+    const right = box(680, 100, 980, 280);
+    const result = await locateCards(fakeLlm(cardsAnswer([left, middle, right])), image, LOCATE_CTX);
+    expect(result.locations).toHaveLength(3);
+    expect(result.note).toBeNull();
+  });
+});
+
+describe('boxes checked against the pixels', () => {
+  const FRAME = { width: 800, height: 600 };
+  const CARD = { x: 200, y: 200, width: 300, height: 200 };
+  let scene: NormalizedImage;
+
+  beforeAll(async () => {
+    const png = await sharp({ create: { ...FRAME, channels: 3, background: '#4a4a4a' } })
+      .composite([{ input: { create: { width: CARD.width, height: CARD.height, channels: 3, background: '#f0f0f0' } }, left: CARD.x, top: CARD.y }])
+      .png()
+      .toBuffer();
+    scene = await saveNormalized(png, path.join(dir, 'scene.jpg'));
+  });
+
+  const clipped = toWire({ ...CARD, width: 225 }, FRAME);
+
+  /** What the model says about the crop of the doubtful box: the card, in the crop's own coordinates. */
+  const cropAnswer = (box: CardLocation['box'], origin: { x: number; y: number }, size: { width: number; height: number }) =>
+    cardsAnswer([toWire({ ...box, x: box.x - origin.x, y: box.y - origin.y }, size)]);
+
+  it('leaves a card whose box is right alone, with no second look', async () => {
+    const llm = fakeLlm(cardsAnswer([toWire(CARD, FRAME)]));
+    const result = await locateCards(llm, scene, LOCATE_CTX);
+    expect(llm.calls).toHaveLength(2);
+    expect(result.countConfirmed).toBe(true);
+    expect(result.locations[0]!.box.width).toBeGreaterThanOrEqual(CARD.width - 3);
+  });
+
+  it('looks again at a box cut short and uses the crop answer, which has the whole card', async () => {
+    // Region of the second look: the clipped box, 35% more on each side.
+    const origin = { x: Math.floor(CARD.x - 225 * 0.35), y: Math.floor(CARD.y - 200 * 0.35) };
+    const size = { width: Math.ceil(CARD.x + 225 * 1.35) - origin.x, height: Math.ceil(CARD.y + 200 * 1.35) - origin.y };
+    const whole = cropAnswer(CARD, origin, size);
+
+    const llm = fakeLlm(cardsAnswer([clipped]), cardsAnswer([clipped]), whole, whole);
+    const result = await locateCards(llm, scene, LOCATE_CTX);
+
+    expect(llm.calls).toHaveLength(4);
+    expect(result.locations).toHaveLength(1);
+    const found = result.locations[0]!.box;
+    expect(Math.abs(found.width - CARD.width)).toBeLessThanOrEqual(4);
+    expect(Math.abs(found.x - CARD.x)).toBeLessThanOrEqual(4);
+    expect(result.countConfirmed).toBe(true);
+    expect(result.note).toMatch(/Looked again at 1 box/);
+  });
+
+  it('leaves the count unconfirmed when the second look cannot be used', async () => {
+    const llm = fakeLlm(cardsAnswer([clipped]), cardsAnswer([clipped]), new Error('boom'));
+    const result = await locateCards(llm, scene, LOCATE_CTX);
+    expect(result.locations).toHaveLength(1);
+    expect(result.countConfirmed).toBe(false);
+    expect(result.note).toMatch(/could not be checked/);
+  });
+
+  it('leaves the count unconfirmed when the model still sees no more than the cut-short box', async () => {
+    const origin = { x: Math.floor(CARD.x - 225 * 0.35), y: Math.floor(CARD.y - 200 * 0.35) };
+    const size = { width: Math.ceil(CARD.x + 225 * 1.35) - origin.x, height: Math.ceil(CARD.y + 200 * 1.35) - origin.y };
+    const same = cropAnswer({ ...CARD, width: 225 }, origin, size);
+    const result = await locateCards(fakeLlm(cardsAnswer([clipped]), cardsAnswer([clipped]), same, same), scene, LOCATE_CTX);
+    expect(result.countConfirmed).toBe(false);
+  });
+
+  it('removes its second-look crops afterwards', async () => {
+    const before = await readdir(dir);
+    await locateCards(fakeLlm(cardsAnswer([clipped]), cardsAnswer([clipped]), new Error('boom')), scene, LOCATE_CTX);
+    expect(await readdir(dir)).toEqual(before);
+  });
+});

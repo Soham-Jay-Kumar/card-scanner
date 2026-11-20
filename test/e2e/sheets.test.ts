@@ -180,11 +180,13 @@ describe.skipIf(!createApp)(`sheets of ${SIZE} cards ${skipReason}`, () => {
 
   /**
    * TOP RELIABILITY RISK. Two passes that miss the same card agree with each other,
-   * so nothing downstream can tell a card is gone. These tests pin what really
-   * happens today. They are not an endorsement of it.
+   * so the passes alone cannot tell a card is gone. The pixel check can: the missed
+   * card's outline sits right beside the boxes of its neighbours, so those boxes look
+   * cut short. The card is still not found, but the count is no longer confirmed, so
+   * a person checks the sheet. These tests pin what really happens today.
    */
   describe('a card missed by BOTH passes', () => {
-    it('is lost silently: no error, no flag, the count reads as confirmed', async () => {
+    it('is still lost, but the pixel check leaves the count unconfirmed for a person', async () => {
       const fixture = fixtures.get('missed-by-both')!;
       const missing = fixture.cards[SIZE >> 1]!;
       const found = cardsOf('missed-by-both');
@@ -203,7 +205,7 @@ describe.skipIf(!createApp)(`sheets of ${SIZE} cards ${skipReason}`, () => {
             note: file.locate?.note,
             fileStage: file.stage,
             reconciliationBalanced: count.balanced,
-            anythingFlaggedTheLoss: false,
+            anythingFlaggedTheLoss: file.locate?.countConfirmed === false,
           },
           null,
           2,
@@ -211,8 +213,8 @@ describe.skipIf(!createApp)(`sheets of ${SIZE} cards ${skipReason}`, () => {
       );
 
       expect(found.map(rowOf)).toEqual(fixture.cards.filter((card) => card !== missing).map((card) => card.row));
-      expect(file.locate?.countConfirmed).toBe(true);
-      expect(file.locate?.note).toBeNull();
+      expect(file.locate?.countConfirmed).toBe(false);
+      expect(file.locate?.note).toMatch(/did not match the pixels/);
       expect(file.stage).toBe('cropped');
       expect(count.balanced).toBe(true);
     });

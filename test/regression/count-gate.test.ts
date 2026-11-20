@@ -1,7 +1,9 @@
 /**
- * A card missed by both locate passes can't be caught automatically, so for any
+ * A card missed by both locate passes can't be found automatically, so for any
  * image with several cards a person must confirm the count before anything can
- * be copied or exported. This pins that gate, including the silent-loss case.
+ * be copied or exported. This pins that gate. The pixel check usually notices the
+ * gap too (the missed card's outline sits beside its neighbours' boxes), but it
+ * can't find the card, so the person still has to add it.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -39,8 +41,8 @@ describe.skipIf(!createApp)(`card count gate ${skipReason}`, () => {
 
     const { job } = await app.runJob([sheet], undefined, 10 * 60_000);
     const [file] = await app.files(job.id);
-    // Both passes agreed, so nothing automatic flags it: only the person can.
-    expect(file!.locate?.countConfirmed).toBe(true);
+    // Both passes agreed, but the pixel check saw an outline no box accounts for, so the count is unconfirmed.
+    expect(file!.locate?.countConfirmed).toBe(false);
     expect(file!.locate?.locations).toHaveLength(5);
 
     expect(await exportStatus(app, job.id)).toBe(409);

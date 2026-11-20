@@ -15,6 +15,8 @@ import type {
 } from '../shared/contracts.ts';
 import { enhanceContrast } from './enhance.ts';
 import { stemOf, writeFileAtomic } from './files.ts';
+import { refineBoxes } from './refine.ts';
+import type { RefinedLocation, Suspect } from './refine.ts';
 
 /** Coordinates in a locate answer run from 0 to this, across the image's width and height. */
 const WIRE_SCALE = 1000;
@@ -39,6 +41,16 @@ const DUPLICATE_IOU = 0.7;
 const SAME_CARD_IOU = 0.5;
 /** Cards share a row when their centres are within this fraction of a card's height. */
 const ROW_TOLERANCE = 0.6;
+/**
+ * A box covering this share of each of two separate boxes, and about a card in size itself,
+ * is half of one card plus half of another. It is no card of its own.
+ */
+const STRADDLE_COVER = 0.4;
+/** The two boxes a straddler spans are separate cards when they share less than this of the smaller. */
+const STRADDLE_NEIGHBOURS_APART = 0.15;
+/** A straddler is about as big as a card, so a box far smaller than the boxes it overlaps is not one. */
+const STRADDLE_MIN_SIZE_RATIO = 0.6;
+
 
 export const LOCATE_INSTRUCTIONS = `You find business cards in an image, so that each one can be cut out and read.
 
@@ -48,6 +60,11 @@ Work through the whole image methodically, row by row, from top to bottom and le
 
 For each card, give the smallest upright rectangle containing all of it, borders included:
 - x_min, y_min, x_max, y_max are numbers from 0 to 1000. (0, 0) is the top-left corner of the image and (1000, 1000) is the bottom-right, whatever the image's shape.
+
+Each rectangle must hold exactly one whole card:
+- Never combine parts of two cards into one rectangle, even when they touch. Find the visible seam or edge between touching cards and put one rectangle on each side of it.
+- Never cut a card short. Every rectangle edge sits on the card's own outer edge, so the card's whole width and height are inside it. A card is not smaller than the others around it just because part of it is dim or blank.
+- Cards in one image are usually the same size. If one rectangle is much larger or smaller than its neighbours, check it again.
 
 For each card, give rotation: how many degrees clockwise the card must be turned to make its main text upright.
 - 0: text already reads normally, left to right.
@@ -175,12 +192,29 @@ function dropOverlaps(locations: CardLocation[]): { kept: CardLocation[]; proble
     overlapOfSmaller(inner.box, outer.box) >= HEAVY_OVERLAP &&
     iou(inner.box, outer.box) < DUPLICATE_IOU;
 
+  /** Two boxes that each lie about half inside this one, while barely touching each other. */
+  const isStraddler = (location: CardLocation) => {
+    const covered = largestFirst.filter(
+      (other) =>
+        other !== location &&
+        intersectionArea(other.box, location.box) / areaOf(other.box) >= STRADDLE_COVER &&
+        areaOf(location.box) >= STRADDLE_MIN_SIZE_RATIO * areaOf(other.box),
+    );
+    return covered.some((first, index) =>
+      covered.slice(index + 1).some((second) => overlapOfSmaller(first.box, second.box) < STRADDLE_NEIGHBOURS_APART),
+    );
+  };
+
   const problems: string[] = [];
   const kept: CardLocation[] = [];
   let duplicates = 0;
   for (const location of largestFirst) {
     if (largestFirst.filter((other) => isInside(other, location)).length >= 2) {
       problems.push('covering several cards');
+      continue;
+    }
+    if (isStraddler(location)) {
+      problems.push('straddling two cards');
       continue;
     }
     const twin = kept.find((other) => overlapOfSmaller(location.box, other.box) >= HEAVY_OVERLAP);
@@ -297,11 +331,13 @@ function reconcile(first: LocatePass, second: LocatePass, image: NormalizedImage
 
   const { pairs, onlyFirst, onlySecond } = matchPasses(first.locations, second.locations);
   // The enclosing box, so one pass cutting a card short can't cut off a printed line.
+  // If one pass ran into a neighbour, the enclosing box now holds a card boundary, which the pixel check catches afterwards.
   const matched = pairs.map(([a, b]) => ({ box: enclosing(a.box, b.box), rotation: a.rotation }));
   const merged = dropOverlaps([...matched, ...onlyFirst, ...onlySecond]);
   const rotationConflicts = pairs.filter(([a, b]) => a.rotation !== b.rotation).length;
 
   const notes = passNotes(first, second);
+  if (merged.problems.length > 0) notes.push(`Merging the passes rejected boxes: ${summarise(merged.problems)}.`);
   if (onlyFirst.length > 0 || onlySecond.length > 0) {
     notes.unshift(
       `Locate passes differ: pass 1 found ${plural(first.locations.length, 'card')} and pass 2 found ${first.locations.length === second.locations.length ? 'the same number in different places' : plural(second.locations.length, 'card')}. ` +
@@ -345,7 +381,125 @@ async function writePassImages(image: NormalizedImage): Promise<string[]> {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Checking boxes against the pixels, and asking again about doubtful ones */
+/* ------------------------------------------------------------------ */
+
+/** Doubtful boxes asked about again, per photo. Each costs two calls, on a small crop. */
+const MAX_RELOOKS = 8;
+/** How much around a doubtful box the second look sees, as a share of the box's size. A clipped box needs room to grow. */
+const RELOOK_MARGIN = 0.35;
+
+/** A closer look giving back a box this close to the one asked about has changed nothing. */
+const RELOOK_UNCHANGED_IOU = 0.9;
+
+interface Relook {
+  suspect: CardLocation;
+  kind: Suspect;
+  /** Boxes the closer look found, in the whole image's pixels. Null when it could not give a usable answer. */
+  found: CardLocation[] | null;
+}
+
+/** Asks the model again about one box, on a crop of just that area, where its coordinates are far more exact. */
+async function relook(llm: LlmClient, image: NormalizedImage, ctx: LlmCallContext, suspect: CardLocation, kind: Suspect): Promise<Relook> {
+  const { box } = suspect;
+  const left = Math.max(0, Math.floor(box.x - box.width * RELOOK_MARGIN));
+  const top = Math.max(0, Math.floor(box.y - box.height * RELOOK_MARGIN));
+  const right = Math.min(image.width, Math.ceil(box.x + box.width * (1 + RELOOK_MARGIN)));
+  const bottom = Math.min(image.height, Math.ceil(box.y + box.height * (1 + RELOOK_MARGIN)));
+  const region = { left, top, width: right - left, height: bottom - top };
+
+  const cropPath = path.join(path.dirname(image.path), `${stemOf(image.path)}-relook-${left}-${top}.jpg`);
+  try {
+    await writeFileAtomic(cropPath, await sharp(image.path).extract(region).jpeg({ quality: CONFIG.image.jpegQuality }).toBuffer());
+    const crop: NormalizedImage = { path: cropPath, width: region.width, height: region.height, sourceFormat: 'jpeg' };
+    const result = await locatePasses(llm, crop, ctx);
+    if (result.noCard || result.fellBackToFullImage || result.locations.length === 0) return { suspect, kind, found: null };
+    const found = result.locations.map(({ box: inner, rotation }) => ({
+      box: { x: inner.x + left, y: inner.y + top, width: inner.width, height: inner.height },
+      rotation,
+    }));
+    return { suspect, kind, found };
+  } finally {
+    await unlink(cropPath).catch(() => {});
+  }
+}
+
+/**
+ * Puts a closer look's boxes in place of the doubtful one. A found box that matches
+ * a box already there replaces it, because the crop placed it more exactly.
+ */
+function applyRelook(current: CardLocation[], suspect: CardLocation, found: CardLocation[]): CardLocation[] {
+  const next = current.filter((location) => location !== suspect);
+  for (const location of found) {
+    const same = next.findIndex((other) => iou(other.box, location.box) >= SAME_CARD_IOU);
+    if (same >= 0) next[same] = location;
+    else next.push(location);
+  }
+  return dropOverlaps(next).kept;
+}
+
+/**
+ * Snaps boxes onto the card outlines in the pixels, then asks the model again about any
+ * box that looks wrong (one holding a card boundary, or cut short), on a crop of its own.
+ */
+async function repair(llm: LlmClient, image: NormalizedImage, ctx: LlmCallContext, result: LocateResult): Promise<LocateResult> {
+  if (result.noCard || result.fellBackToFullImage || result.locations.length === 0) return result;
+
+  let refined: RefinedLocation[];
+  try {
+    refined = await refineBoxes(image, result.locations);
+  } catch {
+    return result; // A box check failing must never lose the cards found.
+  }
+
+  let locations = refined.map(({ location }) => location);
+  const doubtful = refined.filter(({ suspect }) => suspect !== null).slice(0, MAX_RELOOKS);
+  const skipped = refined.filter(({ suspect }) => suspect !== null).length - doubtful.length;
+  if (doubtful.length === 0 && skipped === 0) return { ...result, locations: readingOrder(locations) };
+
+  const outcomes = await Promise.allSettled(doubtful.map(({ location, suspect }) => relook(llm, image, ctx, location, suspect!)));
+  const pause = outcomes.find((outcome) => outcome.status === 'rejected' && outcome.reason instanceof JobPauseError);
+  if (pause?.status === 'rejected') throw pause.reason;
+  ctx.signal?.throwIfAborted();
+
+  let unresolved = skipped;
+  let changed = 0;
+  for (const outcome of outcomes) {
+    if (outcome.status === 'rejected' || outcome.value.found === null) {
+      unresolved += 1;
+      continue;
+    }
+    const { suspect, kind, found } = outcome.value;
+    // The pixels show a strong outline beyond this box and the model sees nothing there. Neither can be trusted, so a person decides.
+    const unchanged = found.length === 1 && iou(found[0]!.box, suspect.box) >= RELOOK_UNCHANGED_IOU;
+    if (kind === 'clipped' && unchanged) unresolved += 1;
+    const before = locations;
+    locations = applyRelook(locations, suspect, found);
+    if (locations.length !== before.length) changed += 1;
+  }
+
+  const notes = [
+    result.note,
+    doubtful.length > 0
+      ? `Looked again at ${doubtful.length === 1 ? '1 box' : `${doubtful.length} boxes`} that did not match the pixels (${summarise(doubtful.map(({ suspect }) => suspect!))}).`
+      : null,
+    changed > 0 ? `The closer look changed the number of cards in ${plural(changed, 'place')}.` : null,
+    unresolved > 0 ? `${unresolved === 1 ? '1 doubtful box' : `${unresolved} doubtful boxes`} could not be checked, so the count is unconfirmed.` : null,
+  ].filter((note) => note !== null);
+  return {
+    ...result,
+    locations: readingOrder(locations),
+    countConfirmed: result.countConfirmed && unresolved === 0,
+    note: notes.length > 0 ? notes.join(' ') : null,
+  };
+}
+
 export async function locateCards(llm: LlmClient, image: NormalizedImage, ctx: LlmCallContext): Promise<LocateResult> {
+  return repair(llm, image, ctx, await locatePasses(llm, image, ctx));
+}
+
+async function locatePasses(llm: LlmClient, image: NormalizedImage, ctx: LlmCallContext): Promise<LocateResult> {
   const passImages = await writePassImages(image);
   try {
     // allSettled, so neither call is still reading its image when the files are removed.

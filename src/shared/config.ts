@@ -6,7 +6,8 @@
 export const CONFIG = {
   /** The user chose GPT-6 Luna for every model call. Do not add other models. */
   model: 'gpt-6-luna',
-  reasoningEffort: { locate: 'low', orient: 'low', read: 'high' },
+  /** Locate is 'medium': 'low' placed boxes loosely, merging or clipping touching cards. */
+  reasoningEffort: { locate: 'medium', orient: 'low', read: 'high' },
   /** OpenAI's recommended detail level for OCR. Luna support is unconfirmed until a real API call. */
   imageDetail: 'original',
   /** Locate returns one box per card, and a single image can hold 30+ cards. */
