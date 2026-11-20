@@ -1,0 +1,16 @@
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  root: 'src/web',
+  plugins: [react()],
+  build: { outDir: '../../dist/web', emptyOutDir: true },
+  server: { port: 5173, proxy: { '/api': 'http://127.0.0.1:4173' } },
+  test: {
+    root: '.',
+    include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
+    environment: 'node',
+    // Generous, because several suites render and decode real images in parallel.
+    testTimeout: 120_000,
+  },
+} as never);
